@@ -1,16 +1,20 @@
+#include "hal/posix_device.hpp"
+#include "common/aligned_buffer.hpp"
+
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <sstream>
-#include <stdexcept>
+#include <vector>
 #include <cstdint>
+#include <algorithm>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/fs.h>
-#include <random>
+#include <cstring>
 
-// 1. The Safety Gate
+// 1. Kunal's Safety Gate (Extended)
 bool passes_safety_gating(const std::string& target_path, uint64_t total_bytes) {
     std::cout << "[*] Running critical safety checks on " << target_path << "...\n";
 
@@ -54,63 +58,55 @@ bool passes_safety_gating(const std::string& target_path, uint64_t total_bytes) 
     return true;
 }
 
-// 2. The Main CLI Execution
-class IBlockDevice {
-public:
-    virtual ~IBlockDevice() = default;
-    virtual bool write_blocks(uint64_t lba, uint32_t count, const void* src_buffer) = 0;
-    virtual uint64_t get_total_sectors() const = 0;
-    virtual uint32_t get_sector_size() const = 0;
-    virtual bool flush() = 0;
-};
-
-class MockDrive : public IBlockDevice {
-    uint64_t sectors;
-public:
-    MockDrive(uint64_t size_bytes) { sectors = size_bytes / 512; }
-    bool write_blocks(uint64_t, uint32_t, const void*) override { return true; } 
-    uint64_t get_total_sectors() const override { return sectors; } 
-    uint32_t get_sector_size() const override { return 512; }
-    bool flush() override { return true; }
-};
-
-// 2. The NIST Wiping Logic
-bool wipe_usb_pendrive(IBlockDevice& dev) {
-    uint32_t sector_size = dev.get_sector_size();
-    uint64_t total_sectors = dev.get_total_sectors();
-    uint32_t chunk_sectors = 2048; 
+// 2. Real Hardware Wiper using your HAL
+bool wipe_block_device(aegis::hal::IBlockDevice& dev) {
+    uint32_t sector_size = dev.sector_size();
+    uint64_t total_sectors = dev.total_sectors();
     
-    std::vector<uint8_t> buffer(chunk_sectors * sector_size, 0);
-    std::cout << "[*] Starting NIST SP 800-88 Clear (2-Pass) for USB Flash...\n";
+    // 1MB chunk size (2048 sectors of 512 bytes)
+    uint32_t chunk_sectors = 2048; 
+    size_t chunk_bytes = static_cast<size_t>(chunk_sectors) * sector_size;
 
-    for (int pass = 1; pass <= 2; ++pass) {
-        uint64_t current_lba = 0;
-        while (current_lba < total_sectors) {
-            uint32_t sectors_to_write = std::min<uint64_t>(chunk_sectors, total_sectors - current_lba);
-            
-            dev.write_blocks(current_lba, sectors_to_write, buffer.data());
-            current_lba += sectors_to_write;
-            
-            // Print progress every 10%
-            if (current_lba % (chunk_sectors * 10) == 0 || current_lba == total_sectors) {
-                double pct = (static_cast<double>(current_lba) / total_sectors) * 100.0;
-                std::cout << "{\"pass\": " << pass << ", \"progress_pct\": " << pct << "}\n";
-            }
+    // Use AlignedBuffer so O_DIRECT doesn't trigger EINVAL
+    aegis::common::AlignedBuffer buffer(chunk_bytes, 4096);
+    std::memset(buffer.data(), 0x00, buffer.size());
+
+    std::cout << "[*] Starting NIST SP 800-88 Clear (Single Pass 0x00) via Direct I/O...\n";
+
+    uint64_t current_lba = 0;
+    while (current_lba < total_sectors) {
+        uint32_t sectors_to_write = static_cast<uint32_t>(std::min<uint64_t>(chunk_sectors, total_sectors - current_lba));
+        
+        // Write the aligned block directly to physical hardware
+        if (!dev.write_sector(current_lba, buffer)) {
+            std::cerr << "\n[-] I/O Error writing at LBA " << current_lba << "\n";
+            return false;
         }
-        dev.flush(); 
+
+        current_lba += sectors_to_write;
+
+        double pct = (static_cast<double>(current_lba) / total_sectors) * 100.0;
+        std::cout << "{\"progress_pct\": " << pct << ", \"lba\": " << current_lba << "}\n";
     }
-    std::cout << "[SUCCESS] Drive securely sanitized and verified.\n";
+
+    std::cout << "[SUCCESS] Entire drive sanitized with unbuffered O_DIRECT physical writes.\n";
     return true;
 }
 
-// 3. The Main Execution
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: sudo ./aegis_cli <target_device>\n";
         return 1;
     }
 
+    if (::geteuid() != 0) {
+        std::cerr << "[-] Error: Root privileges required for raw block access.\n";
+        return 1;
+    }
+
     std::string target_drive = argv[1];
+
+    // Read device size for pre-check
     int fd = open(target_drive.c_str(), O_RDONLY);
     if (fd < 0) {
         std::cerr << "[ERROR] Could not open " << target_drive << ".\n";
@@ -125,11 +121,16 @@ int main(int argc, char* argv[]) {
         return 1; 
     }
 
-    std::cout << "[*] Handing off to the Sanitizer Module...\n";
+    std::cout << "[*] Handing off to POSIX Direct I/O HAL Layer...\n";
     
-    // Run the wipe!
-    MockDrive active_drive(total_bytes);
-    wipe_usb_pendrive(active_drive);
+    aegis::hal::PosixBlockDevice real_device;
+    if (!real_device.open(target_drive)) {
+        std::cerr << "[-] Failed to open physical device handle.\n";
+        return 1;
+    }
+
+    wipe_block_device(real_device);
+    real_device.close();
 
     return 0;
 }
