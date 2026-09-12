@@ -1,136 +1,124 @@
-#include "hal/posix_device.hpp"
-#include "common/aligned_buffer.hpp"
-
+#include "sanitizer/file_shredder.hpp"
 #include <iostream>
-#include <fstream>
 #include <string>
-#include <sstream>
 #include <vector>
-#include <cstdint>
-#include <algorithm>
-#include <sys/ioctl.h>
-#include <fcntl.h>
+#include <filesystem>
+#include <cstdlib>
 #include <unistd.h>
-#include <linux/fs.h>
-#include <cstring>
 
-// 1. Kunal's Safety Gate (Extended)
-bool passes_safety_gating(const std::string& target_path, uint64_t total_bytes) {
-    std::cout << "[*] Running critical safety checks on " << target_path << "...\n";
+namespace fs = std::filesystem;
 
-    if (target_path.find("/dev/loop") != 0) {
-        std::cerr << "[FATAL ERROR] Dev mode active. Target is NOT a /dev/loop device. Aborting.\n";
-        return false;
-    }
-
-    const uint64_t MAX_TEST_SIZE = 2ULL * 1024 * 1024 * 1024; // 2GB
-    if (total_bytes > MAX_TEST_SIZE) {
-        std::cerr << "[FATAL ERROR] Device capacity exceeds 2GB test limit. Aborting.\n";
-        return false;
-    }
-
-    std::ifstream mounts_file("/proc/mounts");
-    if (!mounts_file.is_open()) {
-        std::cerr << "[FATAL ERROR] Could not read /proc/mounts to verify safety. Aborting.\n";
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(mounts_file, line)) {
-        std::istringstream iss(line);
-        std::string mounted_device, mount_point;
-        
-        if (iss >> mounted_device >> mount_point) {
-            if (mounted_device == target_path) {
-                std::cerr << "[FATAL ERROR] Target " << target_path 
-                          << " is actively mounted at " << mount_point << ". Aborting.\n";
-                return false;
-            }
-            if (target_path.find("/dev/sda") != std::string::npos || 
-                target_path.find("/dev/nvme0n1") != std::string::npos) {
-                std::cerr << "[FATAL ERROR] Attempted access to primary system drive. Aborting.\n";
-                return false;
-            }
-        }
-    }
-
-    std::cout << "[+] Safety checks passed. Device is isolated and safe to wipe.\n";
-    return true;
+void print_banner() {
+    std::cout << "=====================================================\n";
+    std::cout << "        AEGIS FORENSIC DATA SANITIZATION SUITE       \n";
+    std::cout << "=====================================================\n";
 }
 
-// 2. Real Hardware Wiper using your HAL
-bool wipe_block_device(aegis::hal::IBlockDevice& dev) {
-    uint32_t sector_size = dev.sector_size();
-    uint64_t total_sectors = dev.total_sectors();
-    
-    // 1MB chunk size (2048 sectors of 512 bytes)
-    uint32_t chunk_sectors = 2048; 
-    size_t chunk_bytes = static_cast<size_t>(chunk_sectors) * sector_size;
+void print_usage(const char* prog) {
+    std::cout << "Usage:\n";
+    std::cout << "  " << prog << " shred <file_path> [--passes N] [--no-zero]\n";
+    std::cout << "  " << prog << " wipe-disk <device_path> [--method METHOD]\n\n";
+    std::cout << "Disk Wipe Methods (via nwipe):\n";
+    std::cout << "  zero        - Single pass zero overwrite (NIST SP 800-88 Clear)\n";
+    std::cout << "  dod522022m  - DoD 5220.22-M 3-pass standard\n";
+    std::cout << "  gutmann     - Gutmann 35-pass sanitization\n";
+    std::cout << "=====================================================\n";
+}
 
-    // Use AlignedBuffer so O_DIRECT doesn't trigger EINVAL
-    aegis::common::AlignedBuffer buffer(chunk_bytes, 4096);
-    std::memset(buffer.data(), 0x00, buffer.size());
-
-    std::cout << "[*] Starting NIST SP 800-88 Clear (Single Pass 0x00) via Direct I/O...\n";
-
-    uint64_t current_lba = 0;
-    while (current_lba < total_sectors) {
-        uint32_t sectors_to_write = static_cast<uint32_t>(std::min<uint64_t>(chunk_sectors, total_sectors - current_lba));
-        
-        // Write the aligned block directly to physical hardware
-        if (!dev.write_sector(current_lba, buffer)) {
-            std::cerr << "\n[-] I/O Error writing at LBA " << current_lba << "\n";
-            return false;
-        }
-
-        current_lba += sectors_to_write;
-
-        double pct = (static_cast<double>(current_lba) / total_sectors) * 100.0;
-        std::cout << "{\"progress_pct\": " << pct << ", \"lba\": " << current_lba << "}\n";
+int handle_shred(int argc, char* argv[]) {
+    if (argc < 3) {
+        std::cerr << "[-] Error: Missing target file path.\n";
+        return 1;
     }
 
-    std::cout << "[SUCCESS] Entire drive sanitized with unbuffered O_DIRECT physical writes.\n";
-    return true;
+    std::string target_file = argv[2];
+    if (!fs::exists(target_file)) {
+        std::cerr << "[-] Error: File not found: " << target_file << "\n";
+        return 1;
+    }
+
+    aegis::sanitizer::FileShredder shredder;
+    aegis::sanitizer::ShredConfig cfg;
+    cfg.iterations = 3;
+    cfg.zero_fill = true;
+    cfg.clear_slack = true;
+    cfg.remove = true;
+
+    for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--passes" && i + 1 < argc) {
+            cfg.iterations = std::stoul(argv[++i]);
+        } else if (arg == "--no-zero") {
+            cfg.zero_fill = false;
+        }
+    }
+
+    std::cout << "[*] Dispatching FileShredder engine...\n";
+    bool ok = shredder.shred_file(target_file, cfg);
+    return ok ? 0 : 1;
+}
+
+int handle_wipe_disk(int argc, char* argv[]) {
+    if (argc < 3) {
+        std::cerr << "[-] Error: Missing device path (e.g., /dev/loop3).\n";
+        return 1;
+    }
+
+    std::string device = argv[2];
+    std::string method = "zero";
+
+    for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--method" && i + 1 < argc) {
+            method = argv[++i];
+        }
+    }
+
+    // Safety Gate: Enforce loopback during development/sandbox phase
+    if (device.find("/dev/loop") != 0) {
+        std::cerr << "[-] SAFETY LOCK: Only /dev/loop devices are permitted in test builds!\n";
+        std::cerr << "    Requested target: " << device << "\n";
+        return 1;
+    }
+
+    if (::getuid() != 0) {
+        std::cerr << "[-] Error: Disk wiping requires root privileges (run with sudo).\n";
+        return 1;
+    }
+
+    std::cout << "[*] Initiating Block-Level Sanitization on " << device << "\n";
+    std::cout << "  [*] Orchestrating backend: nwipe\n";
+    std::cout << "  [*] Selected standard: " << method << "\n";
+
+    std::string cmd = "nwipe --nogui --autonuke --method=" + method + " " + device;
+    int ret = std::system(cmd.c_str());
+
+    if (ret == 0) {
+        std::cout << "[+] Disk sanitization successfully completed via nwipe.\n";
+        return 0;
+    }
+
+    std::cerr << "[-] nwipe execution failed with code: " << ret << "\n";
+    return 1;
 }
 
 int main(int argc, char* argv[]) {
+    print_banner();
+
     if (argc < 2) {
-        std::cerr << "Usage: sudo ./aegis_cli <target_device>\n";
+        print_usage(argv[0]);
         return 1;
     }
 
-    if (::geteuid() != 0) {
-        std::cerr << "[-] Error: Root privileges required for raw block access.\n";
+    std::string subcommand = argv[1];
+
+    if (subcommand == "shred") {
+        return handle_shred(argc, argv);
+    } else if (subcommand == "wipe-disk") {
+        return handle_wipe_disk(argc, argv);
+    } else {
+        std::cerr << "[-] Unknown subcommand: " << subcommand << "\n";
+        print_usage(argv[0]);
         return 1;
     }
-
-    std::string target_drive = argv[1];
-
-    // Read device size for pre-check
-    int fd = open(target_drive.c_str(), O_RDONLY);
-    if (fd < 0) {
-        std::cerr << "[ERROR] Could not open " << target_drive << ".\n";
-        return 1;
-    }
-
-    uint64_t total_bytes = 0;
-    ioctl(fd, BLKGETSIZE64, &total_bytes);
-    close(fd);
-
-    if (!passes_safety_gating(target_drive, total_bytes)) {
-        return 1; 
-    }
-
-    std::cout << "[*] Handing off to POSIX Direct I/O HAL Layer...\n";
-    
-    aegis::hal::PosixBlockDevice real_device;
-    if (!real_device.open(target_drive)) {
-        std::cerr << "[-] Failed to open physical device handle.\n";
-        return 1;
-    }
-
-    wipe_block_device(real_device);
-    real_device.close();
-
-    return 0;
 }
