@@ -1,186 +1,227 @@
 #include "sanitizer/file_shredder.hpp"
-
 #include <iostream>
-#include <random>
 #include <vector>
+#include <random>
 #include <cstring>
-#include <algorithm>
 #include <filesystem>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
+#include <algorithm>
+#include <cstdint>
+#include <cstddef>
+#include <cerrno>
+
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+#else
+  #include <fcntl.h>
+  #include <unistd.h>
+  #include <sys/stat.h>
+#endif
 
 namespace fs = std::filesystem;
 
 namespace aegis::sanitizer {
 
-namespace {
-// Safe universal character set for directory renaming from shred.c
-const char NAMESET[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_.";
-constexpr size_t BUFFER_CHUNK_SIZE = 64 * 1024; // 64KB unbuffered page chunk
-}
-
-bool FileShredder::dosync(int fd) {
-    if (::fdatasync(fd) == 0) return true;
-    if (::fsync(fd) == 0) return true;
-    ::sync();
-    return true;
-}
-
-bool FileShredder::sync_directory(const std::string& dirpath) {
-    int dfd = ::open(dirpath.c_str(), O_RDONLY | O_DIRECTORY);
-    if (dfd < 0) return false;
-    dosync(dfd);
-    ::close(dfd);
-    return true;
-}
-
-bool FileShredder::dopass(int fd, uint64_t size, int pass_num, int total_passes, bool is_zero_pass) {
-    std::cout << "  [*] Pass " << pass_num << "/" << total_passes 
-              << (is_zero_pass ? " [Zero Fill 0x00]" : " [PRNG Chaos Pattern]") << "...\n";
-
-    std::vector<uint8_t> buffer(BUFFER_CHUNK_SIZE);
-    std::random_device rd;
-    std::mt19937_64 prng(rd());
-    std::uniform_int_distribution<uint64_t> dist;
-
-    // Reset file head offset to 0
-    if (::lseek(fd, 0, SEEK_SET) != 0) {
-        std::cerr << "  [-] Failed to rewind file descriptor.\n";
-        return false;
-    }
-
-    uint64_t bytes_written = 0;
-    while (bytes_written < size) {
-        size_t current_chunk = static_cast<size_t>(std::min<uint64_t>(BUFFER_CHUNK_SIZE, size - bytes_written));
-
-        if (is_zero_pass) {
-            std::memset(buffer.data(), 0x00, current_chunk);
-        } else {
-            // Fill 64-bit random words for maximum throughput
-            for (size_t i = 0; i < current_chunk; i += sizeof(uint64_t)) {
-                uint64_t val = dist(prng);
-                std::memcpy(buffer.data() + i, &val, std::min<size_t>(sizeof(uint64_t), current_chunk - i));
-            }
-        }
-
-        ssize_t written = ::write(fd, buffer.data(), current_chunk);
-        if (written <= 0) {
-            std::cerr << "  [-] Write failure during pass at offset " << bytes_written << "\n";
-            return false;
-        }
-        bytes_written += written;
-    }
-
-    // Force disk controller commit after every pass
-    return dosync(fd);
-}
-
-bool FileShredder::do_wipefd(int fd, uint64_t target_size, const ShredConfig& config) {
-    int total_passes = config.iterations + (config.zero_fill ? 1 : 0);
-
-    // Run random data passes
-    for (uint32_t i = 1; i <= config.iterations; ++i) {
-        if (!dopass(fd, target_size, i, total_passes, false)) {
-            return false;
+static size_t get_platform_block_size(const std::string& path) {
+#ifdef _WIN32
+    WCHAR root_path[MAX_PATH];
+    std::wstring wpath = fs::path(path).wstring();
+    if (GetVolumePathNameW(wpath.c_str(), root_path, MAX_PATH)) {
+        DWORD sectorsPerCluster = 0, bytesPerSector = 0, freeClusters = 0, totalClusters = 0;
+        if (GetDiskFreeSpaceW(root_path, &sectorsPerCluster, &bytesPerSector, &freeClusters, &totalClusters)) {
+            return static_cast<size_t>(sectorsPerCluster * bytesPerSector);
         }
     }
-
-    // Run final zero-fill pass to conceal the shred signature
-    if (config.zero_fill) {
-        if (!dopass(fd, target_size, total_passes, total_passes, true)) {
-            return false;
-        }
+    return 4096;
+#else
+    struct stat st;
+    if (::stat(path.c_str(), &st) == 0 && st.st_blksize > 0) {
+        return static_cast<size_t>(st.st_blksize);
     }
-
-    // Truncate file allocation to 0 bytes on disk
-    if (::ftruncate(fd, 0) != 0) {
-        std::cerr << "  [-] Warning: ftruncate to 0 failed.\n";
-    }
-    dosync(fd);
-
-    return true;
+    return 4096;
+#endif
 }
 
-bool FileShredder::wipename(const std::string& filepath) {
-    fs::path orig(filepath);
-    fs::path dir = orig.parent_path().empty() ? "." : orig.parent_path();
-    std::string base = orig.filename().string();
-
-    std::cout << "  [*] Scrubbing directory table metadata (inode entry obfuscation)...\n";
-
-    // Repeatedly rename to progressively shorter sequences (e.g. 00000 -> 0000 -> 0)
-    for (size_t len = base.length(); len > 0; --len) {
-        std::string obf_name(len, NAMESET[0]);
-        fs::path new_path = dir / obf_name;
-
-        if (::rename(orig.c_str(), new_path.c_str()) == 0) {
-            orig = new_path;
-            sync_directory(dir.string()); // Commit modified directory slot to disk
-        }
-    }
-
-    // Final unlink deletes an obfuscated dummy record
-    if (::unlink(orig.c_str()) != 0) {
-        std::cerr << "  [-] Failed to unlink final file.\n";
-        return false;
-    }
-
-    sync_directory(dir.string());
-    std::cout << "  [+] Directory record obliterated and unlinked.\n";
-    return true;
+static bool flush_hardware_buffers(
+#ifdef _WIN32
+    HANDLE handle
+#else
+    int fd
+#endif
+) {
+#ifdef _WIN32
+    return FlushFileBuffers(handle) != 0;
+#else
+    return ::fdatasync(fd) == 0;
+#endif
 }
 
 bool FileShredder::shred_file(const std::string& filepath, const ShredConfig& config) {
-    struct stat st;
-    if (::stat(filepath.c_str(), &st) != 0) {
-        std::cerr << "[-] Target file does not exist: " << filepath << "\n";
+    if (!fs::exists(filepath)) {
+        std::cerr << "[-] Target does not exist: " << filepath << "\n";
         return false;
     }
 
-    // Validate target is a regular file (never attack sockets/pipes)
-    if (!S_ISREG(st.st_mode)) {
-        std::cerr << "[-] Safety: Target is not a regular file.\n";
-        return false;
-    }
+    std::uintmax_t raw_size = fs::file_size(filepath);
+    size_t block_size = get_platform_block_size(filepath);
 
-    uint64_t wipe_size = static_cast<uint64_t>(st.st_size);
-
-    // Slack space rounding from shred.c: round up to st_blksize to purge tail slack
-    if (config.clear_slack && st.st_blksize > 0) {
-        uint64_t remainder = wipe_size % st.st_blksize;
+    std::uintmax_t target_size = raw_size;
+    if (config.clear_slack && block_size > 0) {
+        std::uintmax_t remainder = raw_size % block_size;
         if (remainder != 0) {
-            wipe_size += (st.st_blksize - remainder);
+            target_size = raw_size + (block_size - remainder);
             std::cout << "  [+] Slack space rounding: Adjusted target size to " 
-                      << wipe_size << " bytes (Block size: " << st.st_blksize << ")\n";
+                      << target_size << " bytes (Block size: " << block_size << ")\n";
         }
     }
 
-    std::cout << "[*] Target identified: " << filepath << " (" << st.st_size << " bytes)\n";
+    std::cout << "[*] Target identified: " << filepath << " (" << raw_size << " bytes)\n";
 
-    int fd = ::open(filepath.c_str(), O_WRONLY | O_SYNC);
-    if (fd < 0) {
-        // Fallback: Attempt chmod permissions bypass if writable bit is absent
-        ::chmod(filepath.c_str(), S_IWUSR);
-        fd = ::open(filepath.c_str(), O_WRONLY | O_SYNC);
-        if (fd < 0) {
-            std::cerr << "[-] Error opening file descriptor for writing.\n";
-            return false;
-        }
-    }
+#ifdef _WIN32
+    std::wstring wpath = fs::path(filepath).wstring();
+    HANDLE handle = CreateFileW(
+        wpath.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+        NULL
+    );
 
-    // Execute the overwrite passes
-    bool wipe_ok = do_wipefd(fd, wipe_size, config);
-    ::close(fd);
-
-    if (!wipe_ok) {
-        std::cerr << "[-] Shredding passes encountered an error.\n";
+    if (handle == INVALID_HANDLE_VALUE) {
+        std::cerr << "[-] Error: Failed to open file handle on Windows (Error: " << GetLastError() << ")\n";
         return false;
     }
+#else
+    int fd = ::open(filepath.c_str(), O_RDWR | O_SYNC);
+    if (fd < 0) {
+        std::cerr << "[-] Error opening file: " << std::strerror(errno) << "\n";
+        return false;
+    }
+#endif
 
-    // Obfuscate directory metadata and unlink
+    const size_t chunk_size = 64 * 1024;
+    std::vector<uint8_t> buffer(chunk_size);
+    std::mt19937_64 rng(std::random_device{}());
+
+    for (size_t pass = 1; pass <= config.iterations; ++pass) {
+        std::cout << "  [*] Pass " << pass << "/" 
+                  << (config.zero_fill ? config.iterations + 1 : config.iterations) 
+                  << " [PRNG Chaos Pattern]...\n";
+
+#ifdef _WIN32
+        LARGE_INTEGER li;
+        li.QuadPart = 0;
+        SetFilePointerEx(handle, li, NULL, FILE_BEGIN);
+#else
+        ::lseek(fd, 0, SEEK_SET);
+#endif
+
+        std::uintmax_t bytes_written = 0;
+        while (bytes_written < target_size) {
+            size_t to_write = std::min<std::uintmax_t>(chunk_size, target_size - bytes_written);
+
+            size_t* word_ptr = reinterpret_cast<size_t*>(buffer.data());
+            size_t words = to_write / sizeof(size_t);
+            for (size_t i = 0; i < words; ++i) {
+                word_ptr[i] = rng();
+            }
+
+#ifdef _WIN32
+            DWORD written = 0;
+            if (!WriteFile(handle, buffer.data(), static_cast<DWORD>(to_write), &written, NULL)) {
+                std::cerr << "[-] Windows write failure on pass " << pass << "\n";
+                CloseHandle(handle);
+                return false;
+            }
+            bytes_written += written;
+#else
+            ssize_t res = ::write(fd, buffer.data(), to_write);
+            if (res < 0) {
+                std::cerr << "[-] POSIX write failure on pass " << pass << ": " << std::strerror(errno) << "\n";
+                ::close(fd);
+                return false;
+            }
+            bytes_written += res;
+#endif
+        }
+
+#ifdef _WIN32
+        flush_hardware_buffers(handle);
+#else
+        flush_hardware_buffers(fd);
+#endif
+    }
+
+    if (config.zero_fill) {
+        std::cout << "  [*] Pass " << config.iterations + 1 << "/" 
+                  << config.iterations + 1 << " [Zero Fill 0x00]...\n";
+
+        std::fill(buffer.begin(), buffer.end(), 0x00);
+
+#ifdef _WIN32
+        LARGE_INTEGER li;
+        li.QuadPart = 0;
+        SetFilePointerEx(handle, li, NULL, FILE_BEGIN);
+#else
+        ::lseek(fd, 0, SEEK_SET);
+#endif
+
+        std::uintmax_t bytes_written = 0;
+        while (bytes_written < target_size) {
+            size_t to_write = std::min<std::uintmax_t>(chunk_size, target_size - bytes_written);
+#ifdef _WIN32
+            DWORD written = 0;
+            WriteFile(handle, buffer.data(), static_cast<DWORD>(to_write), &written, NULL);
+            bytes_written += written;
+#else
+            ssize_t res = ::write(fd, buffer.data(), to_write);
+            bytes_written += res;
+#endif
+        }
+
+#ifdef _WIN32
+        flush_hardware_buffers(handle);
+#else
+        flush_hardware_buffers(fd);
+#endif
+    }
+
+#ifdef _WIN32
+    CloseHandle(handle);
+#else
+    ::close(fd);
+#endif
+
+    // 3. Metadata Obfuscation & File Removal
     if (config.remove) {
-        return wipename(filepath);
+        std::cout << "  [*] Scrubbing directory table metadata (inode entry obfuscation)...\n";
+        
+        fs::path p(filepath);
+        fs::path parent_dir = p.parent_path();
+        std::string current_name = p.filename().string();
+
+        for (size_t i = 0; i < current_name.length(); ++i) {
+            std::string temp_name = std::string(current_name.length() - i, '0' + (i % 10));
+            fs::path new_path = parent_dir.empty() ? fs::path(temp_name) : parent_dir / temp_name;
+            fs::path old_path = parent_dir.empty() ? fs::path(current_name) : parent_dir / current_name;
+            
+            std::error_code ec;
+            fs::rename(old_path, new_path, ec);
+            if (!ec) {
+                current_name = temp_name;
+            }
+        }
+
+        fs::path final_path = parent_dir.empty() ? fs::path(current_name) : parent_dir / current_name;
+        std::error_code ec;
+        fs::remove(final_path, ec);
+        if (!ec) {
+            std::cout << "  [+] Directory record obliterated and unlinked.\n";
+        }
     }
 
     return true;
