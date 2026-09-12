@@ -8,7 +8,7 @@ A verifiable forensic data sanitization suite engineered in C++20 for high-assur
 
 Install GCC with C++20 support and `nwipe`:
 
-\`\`\`bash
+\\\bash
 sudo dnf install -y gcc-c++ nwipe
 \`\`\`
 
