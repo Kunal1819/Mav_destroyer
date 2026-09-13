@@ -34,7 +34,9 @@ struct AuditRecord {
     bool verification_passed = false;
     double calculated_entropy = 0.0;
     std::string verification_type = "NONE";
-    bool metadata_scrub_completed = false;   // NEW: tracks rename/unlink success
+    bool metadata_scrub_completed = false;
+    bool slack_space_eliminated = false;
+    std::string slack_space_status = "NOT_ATTEMPTED";
     std::string status = "PENDING";
     std::string start_time;
     std::string end_time;
@@ -56,11 +58,13 @@ private:
     std::vector<AuditRecord> records_;
 
     bool execute_passes(const std::filesystem::path& path, uint64_t size, uint32_t& passes_executed);
+    bool eliminate_slack_space(const std::filesystem::path& path, uint64_t logical_size, std::string& out_status);
     bool verify_target_pattern(const std::filesystem::path& path, uint64_t size, uint8_t expected_byte);
     bool verify_entropy(const std::filesystem::path& path, uint64_t size, double& out_entropy);
     void deallocate_blocks(int fd, uint64_t size);
-    bool scrub_metadata(const std::filesystem::path& path);   // CHANGED: void -> bool
+    bool scrub_metadata(const std::filesystem::path& path);
     std::string get_standard_name() const;
+    std::vector<uint8_t> get_final_pass_pattern() const;
 };
 
 } // namespace aegis::sanitizer
