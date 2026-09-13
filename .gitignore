@@ -20,3 +20,8 @@ shred.c
 *.tmp
 *.bin
 *.json
+
+recup_dir.[1|2]
+
+photorec.se2
+
