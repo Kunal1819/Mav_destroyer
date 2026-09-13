@@ -7,12 +7,17 @@
 #include <sstream>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
+#include <array>
 
 #if defined(__linux__) || defined(__unix__)
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <linux/falloc.h>
+#include <linux/fs.h>
+#include <linux/fiemap.h>
 #endif
 
 namespace aegis::sanitizer
@@ -47,6 +52,62 @@ namespace aegis::sanitizer
         return "Unknown Standard";
     }
 
+    std::vector<uint8_t> FileShredder::get_final_pass_pattern() const
+    {
+        switch (config_.method)
+        {
+        case SanitizationMethod::NIST_800_88_CLEAR:
+        case SanitizationMethod::ZERO_ONLY:
+            return {0x00};
+
+        case SanitizationMethod::DOD_5220_22_M:
+        {
+            // DoD final pass (Pass 3) is PRNG random noise
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint16_t> dist(0, 255);
+            std::vector<uint8_t> rnd_pattern(512);
+            for (auto &b : rnd_pattern)
+            {
+                b = static_cast<uint8_t>(dist(gen));
+            }
+            return rnd_pattern;
+        }
+
+        case SanitizationMethod::PRNG_CUSTOM:
+        {
+            if (config_.zero_fill)
+            {
+                return {0x00};
+            }
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint16_t> dist(0, 255);
+            std::vector<uint8_t> rnd_pattern(512);
+            for (auto &b : rnd_pattern)
+            {
+                b = static_cast<uint8_t>(dist(gen));
+            }
+            return rnd_pattern;
+        }
+
+        case SanitizationMethod::GUTMANN:
+        {
+            // Gutmann final passes (32-35) are pseudo-random noise
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint16_t> dist(0, 255);
+            std::vector<uint8_t> rnd_pattern(512);
+            for (auto &b : rnd_pattern)
+            {
+                b = static_cast<uint8_t>(dist(gen));
+            }
+            return rnd_pattern;
+        }
+        }
+        return {0x00};
+    }
+
     void FileShredder::deallocate_blocks(int fd, uint64_t size)
     {
 #if defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE)
@@ -63,6 +124,177 @@ namespace aegis::sanitizer
         (void)size;
 #endif
     }
+
+    // starts from here
+
+    // Slack space elimination assumes in-place, non-COW filesystems (ext4, XFS).
+    // On Copy-on-Write (COW) filesystems (e.g., btrfs, ZFS, OpenZFS), growing a file via ftruncate
+    // may allocate a new physical extent entirely rather than reusing the tail cluster block.
+    bool FileShredder::eliminate_slack_space(const std::filesystem::path &path, uint64_t logical_size, std::string &out_status)
+    {
+#if defined(__linux__)
+        if (logical_size == 0)
+        {
+            out_status = "SKIPPED_EMPTY_FILE";
+            return true;
+        }
+
+        int fd = open(path.c_str(), O_RDWR);
+        if (fd < 0)
+        {
+            out_status = "FAILED_OPEN_FILE";
+            std::cerr << "[-] FIEMAP Slack: Failed to open file for R/W: " << path << "\n";
+            return false;
+        }
+
+        // 1. Query filesystem-reported physical block size via fstat
+        struct stat st;
+        if (fstat(fd, &st) != 0)
+        {
+            close(fd);
+            out_status = "FAILED_FSTAT";
+            return false;
+        }
+
+        uint64_t block_size = (st.st_blksize > 0) ? static_cast<uint64_t>(st.st_blksize) : 4096;
+        uint64_t remainder = logical_size % block_size;
+        if (remainder == 0)
+        {
+            close(fd);
+            out_status = "SKIPPED_NO_SLACK";
+            return true;
+        }
+
+        // 2. Discover physical mapping via FS_IOC_FIEMAP
+        constexpr uint32_t kMaxExtents = 32;
+        size_t fiemap_size = sizeof(struct fiemap) + (kMaxExtents * sizeof(struct fiemap_extent));
+        std::vector<uint8_t> fiemap_buffer(fiemap_size, 0);
+
+        struct fiemap *fmap = reinterpret_cast<struct fiemap *>(fiemap_buffer.data());
+        fmap->fm_start = 0;
+        fmap->fm_length = logical_size;
+        fmap->fm_flags = FIEMAP_FLAG_SYNC;
+        fmap->fm_extent_count = kMaxExtents;
+
+        if (ioctl(fd, FS_IOC_FIEMAP, fmap) < 0)
+        {
+            int err = errno;
+            close(fd);
+            if (err == ENOTTY || err == EOPNOTSUPP)
+            {
+                out_status = "FAILED_NO_FIEMAP_SUPPORT";
+                std::cerr << "[-] FIEMAP Slack: Filesystem does not support FIEMAP ioctl.\n";
+            }
+            else
+            {
+                out_status = "FAILED_IOCTL_ERROR";
+                std::cerr << "[-] FIEMAP Slack: FS_IOC_FIEMAP ioctl error (errno: " << err << ")\n";
+            }
+            return false;
+        }
+
+        if (fmap->fm_mapped_extents == 0)
+        {
+            close(fd);
+            out_status = "FAILED_NO_EXTENTS";
+            std::cerr << "[-] FIEMAP Slack: No physical extents mapped (sparse/inline file).\n";
+            return false;
+        }
+
+        // Inspect the actual terminal extent
+        const struct fiemap_extent &last_extent = fmap->fm_extents[fmap->fm_mapped_extents - 1];
+
+        // Inline data check (ext4 inline data feature stores tiny files in inode space)
+        if (last_extent.fe_flags & FIEMAP_EXTENT_DATA_INLINE)
+        {
+            close(fd);
+            out_status = "SKIPPED_INLINE_INODE_DATA";
+            return true;
+        }
+
+        uint64_t target_size = logical_size + (block_size - remainder);
+        size_t bytes_to_overwrite = static_cast<size_t>(target_size - logical_size);
+
+        // 3. Temporarily grow logical EOF to physical block boundary
+        if (ftruncate(fd, static_cast<off_t>(target_size)) != 0)
+        {
+            int err = errno;
+            close(fd);
+            out_status = "FAILED_FTRUNCATE_GROW";
+            std::cerr << "[-] FIEMAP Slack: ftruncate grow failed (errno: " << err << ")\n";
+            return false;
+        }
+
+        // 4. Seek to the start of slack space (original logical EOF)
+        if (lseek(fd, static_cast<off_t>(logical_size), SEEK_SET) == static_cast<off_t>(-1))
+        {
+            int err = errno;
+            ftruncate(fd, static_cast<off_t>(logical_size));
+            close(fd);
+            out_status = "FAILED_SEEK_EOF";
+            std::cerr << "[-] FIEMAP Slack: lseek to logical EOF failed (errno: " << err << ")\n";
+            return false;
+        }
+
+        // 5. Overwrite slack space matching the final pass pattern
+        std::vector<uint8_t> pattern = get_final_pass_pattern();
+        std::vector<uint8_t> write_buf(bytes_to_overwrite);
+        for (size_t i = 0; i < bytes_to_overwrite; ++i)
+        {
+            write_buf[i] = pattern[i % pattern.size()];
+        }
+
+        size_t total_written = 0;
+        while (total_written < bytes_to_overwrite)
+        {
+            ssize_t written = write(fd, write_buf.data() + total_written, bytes_to_overwrite - total_written);
+            if (written <= 0)
+            {
+                int err = errno;
+                ftruncate(fd, static_cast<off_t>(logical_size));
+                close(fd);
+                out_status = "FAILED_WRITE_SLACK";
+                std::cerr << "[-] FIEMAP Slack: write to slack bytes failed (errno: " << err << ")\n";
+                return false;
+            }
+            total_written += static_cast<size_t>(written);
+        }
+
+        // 6. Flush writes to disk
+        if (fdatasync(fd) != 0)
+        {
+            int err = errno;
+            ftruncate(fd, static_cast<off_t>(logical_size));
+            close(fd);
+            out_status = "FAILED_FDATASYNC";
+            std::cerr << "[-] FIEMAP Slack: fdatasync failed (errno: " << err << ")\n";
+            return false;
+        }
+
+        // 7. Restore original logical size boundary
+        if (ftruncate(fd, static_cast<off_t>(logical_size)) != 0)
+        {
+            int err = errno;
+            close(fd);
+            out_status = "FAILED_FTRUNCATE_RESTORE";
+            std::cerr << "[-] FIEMAP Slack: ftruncate restore failed (errno: " << err << ")\n";
+            return false;
+        }
+
+        fdatasync(fd);
+        close(fd);
+
+        out_status = "SUCCESS";
+        return true;
+#else
+        (void)path;
+        (void)logical_size;
+        out_status = "UNSUPPORTED_PLATFORM";
+        return false;
+#endif
+    }
+
+    // till here
 
     bool FileShredder::verify_target_pattern(const std::filesystem::path &path, uint64_t size, uint8_t expected_byte)
     {
@@ -97,8 +329,64 @@ namespace aegis::sanitizer
         return bytes_checked == size;
     }
 
+    bool FileShredder::verify_entropy(const std::filesystem::path &path, uint64_t size, double &out_entropy)
+    {
+        out_entropy = 0.0;
+        if (size == 0)
+        {
+            out_entropy = 0.0;
+            return true;
+        }
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open())
+            return false;
+
+        std::array<uint64_t, 256> frequencies{};
+        frequencies.fill(0);
+
+        std::vector<char> buffer(config_.buffer_size, 0);
+        uint64_t total_read = 0;
+
+        while (total_read < size)
+        {
+            size_t to_read = std::min(static_cast<uint64_t>(buffer.size()), size - total_read);
+            in.read(buffer.data(), to_read);
+            std::streamsize bytes_read = in.gcount();
+            if (bytes_read <= 0)
+                break;
+
+            for (std::streamsize i = 0; i < bytes_read; ++i)
+            {
+                frequencies[static_cast<uint8_t>(buffer[i])]++;
+            }
+            total_read += bytes_read;
+        }
+
+        if (total_read == 0)
+            return false;
+
+        double entropy = 0.0;
+        for (int i = 0; i < 256; ++i)
+        {
+            if (frequencies[i] > 0)
+            {
+                double p = static_cast<double>(frequencies[i]) / static_cast<double>(total_read);
+                entropy -= p * std::log2(p);
+            }
+        }
+
+        out_entropy = entropy;
+        double threshold = (size < 1024) ? 7.0 : 7.80;
+        return (out_entropy >= threshold);
+    }
+
     bool FileShredder::execute_passes(const std::filesystem::path &path, uint64_t size, uint32_t &passes_executed)
     {
+        passes_executed = 0;
+        if (size == 0)
+            return true;
+
         std::fstream stream(path, std::ios::in | std::ios::out | std::ios::binary);
         if (!stream.is_open())
         {
@@ -106,144 +394,187 @@ namespace aegis::sanitizer
             return false;
         }
 
-        // Cluster slack-space alignment (round up to 4096-byte hardware blocks)
-        const uint64_t cluster_size = 4096;
-        uint64_t wipe_size = ((size + cluster_size - 1) / cluster_size) * cluster_size;
-        if (wipe_size == 0)
-            wipe_size = cluster_size;
-
         std::vector<char> buffer(config_.buffer_size);
         std::random_device rd;
         std::mt19937_64 prng(rd());
         std::uniform_int_distribution<uint64_t> dist;
 
-        auto write_constant_pass = [&](uint8_t byte_val)
+        auto write_pass_internal = [&](const auto &fill_chunk) -> bool
         {
             stream.seekp(0, std::ios::beg);
-            std::fill(buffer.begin(), buffer.end(), static_cast<char>(byte_val));
-            uint64_t written = 0;
-            while (written < wipe_size)
-            {
-                size_t chunk = std::min(static_cast<uint64_t>(buffer.size()), wipe_size - written);
-                stream.write(buffer.data(), chunk);
-                written += chunk;
-            }
-            stream.flush();
-            passes_executed++;
-        };
+            if (stream.fail())
+                return false;
 
-        auto write_random_pass = [&]()
-        {
-            stream.seekp(0, std::ios::beg);
             uint64_t written = 0;
-            while (written < wipe_size)
+            while (written < size)
             {
-                size_t chunk = std::min(static_cast<uint64_t>(buffer.size()), wipe_size - written);
-                for (size_t i = 0; i < chunk; i += sizeof(uint64_t))
+                size_t chunk = std::min(static_cast<uint64_t>(buffer.size()), size - written);
+                fill_chunk(buffer.data(), chunk);
+
+                stream.write(buffer.data(), chunk);
+                if (stream.bad() || stream.fail())
                 {
-                    uint64_t r = dist(prng);
-                    size_t copy_bytes = std::min(sizeof(uint64_t), chunk - i);
-                    std::memcpy(buffer.data() + i, &r, copy_bytes);
+                    std::cerr << "[-] I/O write failure on target: " << path << "\n";
+                    return false;
                 }
-                stream.write(buffer.data(), chunk);
                 written += chunk;
             }
             stream.flush();
+            if (stream.bad() || stream.fail())
+                return false;
+
             passes_executed++;
+            return true;
         };
 
-        auto write_pattern_pass = [&](const std::vector<uint8_t> &pat)
+        auto write_constant_pass = [&](uint8_t byte_val) -> bool
         {
-            stream.seekp(0, std::ios::beg);
-            for (size_t i = 0; i < buffer.size(); ++i)
-            {
-                buffer[i] = static_cast<char>(pat[i % pat.size()]);
-            }
-            uint64_t written = 0;
-            while (written < wipe_size)
-            {
-                size_t chunk = std::min(static_cast<uint64_t>(buffer.size()), wipe_size - written);
-                stream.write(buffer.data(), chunk);
-                written += chunk;
-            }
-            stream.flush();
-            passes_executed++;
+            return write_pass_internal([&](char *buf, size_t chunk)
+                                       { std::fill_n(buf, chunk, static_cast<char>(byte_val)); });
         };
 
-        passes_executed = 0;
+        auto write_random_pass = [&]() -> bool
+        {
+            return write_pass_internal([&](char *buf, size_t chunk)
+                                       {
+            for (size_t i = 0; i < chunk; i += sizeof(uint64_t)) {
+                uint64_t r = dist(prng);
+                size_t copy_bytes = std::min(sizeof(uint64_t), chunk - i);
+                std::memcpy(buf + i, &r, copy_bytes);
+            } });
+        };
+
+        auto write_pattern_pass = [&](const std::vector<uint8_t> &pat) -> bool
+        {
+            return write_pass_internal([&](char *buf, size_t chunk)
+                                       {
+            for (size_t i = 0; i < chunk; ++i) {
+                buf[i] = static_cast<char>(pat[i % pat.size()]);
+            } });
+        };
 
         switch (config_.method)
         {
         case SanitizationMethod::NIST_800_88_CLEAR:
         case SanitizationMethod::ZERO_ONLY:
-            write_constant_pass(0x00);
+            if (!write_constant_pass(0x00))
+                return false;
             break;
 
         case SanitizationMethod::DOD_5220_22_M:
-            write_constant_pass(0x00);
-            write_constant_pass(0xFF);
-            write_random_pass();
+            if (!write_constant_pass(0x00))
+                return false;
+            if (!write_constant_pass(0xFF))
+                return false;
+            if (!write_random_pass())
+                return false;
             break;
 
         case SanitizationMethod::PRNG_CUSTOM:
             for (uint32_t i = 0; i < config_.passes; ++i)
             {
-                write_random_pass();
+                if (!write_random_pass())
+                    return false;
             }
             if (config_.zero_fill)
             {
-                write_constant_pass(0x00);
+                if (!write_constant_pass(0x00))
+                    return false;
             }
             break;
 
         case SanitizationMethod::GUTMANN:
         {
-            // Passes 1-4: Random
             for (int i = 0; i < 4; ++i)
-                write_random_pass();
-
-            // Passes 5-31: 27 specific magnetic patterns
-            const std::vector<std::vector<uint8_t>> patterns = {
-                {0x55}, {0xAA}, {0x92, 0x49, 0x24}, {0x49, 0x24, 0x92}, {0x24, 0x92, 0x49}, {0x00}, {0x11}, {0x22}, {0x33}, {0x44}, {0x55}, {0x66}, {0x77}, {0x88}, {0x99}, {0xAA}, {0xBB}, {0xCC}, {0xDD}, {0xEE}, {0xFF}, {0x92, 0x49, 0x24}, {0x49, 0x24, 0x92}, {0x24, 0x92, 0x49}, {0x6D, 0xB6, 0xDB}, {0xB6, 0xDB, 0x6D}, {0xDB, 0x6D, 0xB6}};
-            for (const auto &pat : patterns)
             {
-                write_pattern_pass(pat);
+                if (!write_random_pass())
+                    return false;
             }
 
-            // Passes 32-35: Random
+            std::vector<std::vector<uint8_t>> patterns = {
+                {0x55}, {0xAA}, {0x92, 0x49, 0x24}, {0x49, 0x24, 0x92}, {0x24, 0x92, 0x49}, {0x00}, {0x11}, {0x22}, {0x33}, {0x44}, {0x55}, {0x66}, {0x77}, {0x88}, {0x99}, {0xAA}, {0xBB}, {0xCC}, {0xDD}, {0xEE}, {0xFF}, {0x92, 0x49, 0x24}, {0x49, 0x24, 0x92}, {0x24, 0x92, 0x49}, {0x6D, 0xB6, 0xDB}, {0xB6, 0xDB, 0x6D}, {0xDB, 0x6D, 0xB6}};
+            std::shuffle(patterns.begin(), patterns.end(), prng);
+
+            for (const auto &pat : patterns)
+            {
+                if (!write_pattern_pass(pat))
+                    return false;
+            }
+
             for (int i = 0; i < 4; ++i)
-                write_random_pass();
+            {
+                if (!write_random_pass())
+                    return false;
+            }
             break;
         }
-        } 
+        }
+
         stream.close();
         return true;
     }
 
-    void FileShredder::scrub_metadata(const std::filesystem::path &path)
+    bool FileShredder::scrub_metadata(const std::filesystem::path &path)
     {
         namespace fs = std::filesystem;
         std::error_code ec;
 
         fs::path parent = path.parent_path();
+        std::string original_name = path.filename().string();
+        size_t len = original_name.length();
+
         fs::path current_path = path;
 
-        std::vector<std::string> dummy_names = {
-            "aaaaaaaa.tmp",
-            "00000000.tmp",
-            "zzzzzzzz.tmp"};
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<uint32_t> dist(100000, 999999);
+        std::string nonce = std::to_string(dist(gen));
 
-        for (const auto &dummy : dummy_names)
+        bool all_renames_succeeded = true;
+
+        // 1. Overwrite with full-length zero mask
+        std::string full_mask(len, '0');
+        fs::path target_full = parent / (full_mask + "_" + nonce);
+        fs::rename(current_path, target_full, ec);
+        if (!ec)
         {
-            fs::path target = parent / dummy;
-            fs::rename(current_path, target, ec);
-            if (!ec)
-            {
-                current_path = target;
-            }
+            current_path = target_full;
+        }
+        else
+        {
+            all_renames_succeeded = false;
         }
 
+        // 2. Overwrite with full-length complement mask
+        std::string alt_mask(len, 'A');
+        fs::path target_alt = parent / (alt_mask + "_" + nonce);
+        fs::rename(current_path, target_alt, ec);
+        if (!ec)
+        {
+            current_path = target_alt;
+        }
+        else
+        {
+            all_renames_succeeded = false;
+        }
+
+        // 3. Truncate name down to minimal token
+        fs::path target_single = parent / ("0_" + nonce);
+        fs::rename(current_path, target_single, ec);
+        if (!ec)
+        {
+            current_path = target_single;
+        }
+        else
+        {
+            all_renames_succeeded = false;
+        }
+
+        // 4. Physical unlink
         fs::remove(current_path, ec);
+        bool remove_succeeded = !ec;
+
+        return all_renames_succeeded && remove_succeeded;
     }
 
     bool FileShredder::shred_file(const std::filesystem::path &file_path)
@@ -266,6 +597,7 @@ namespace aegis::sanitizer
         uint64_t file_size = fs::file_size(file_path, ec);
         record.file_size_bytes = file_size;
 
+        // 1. OVERWRITE PASSES
         uint32_t passes_executed = 0;
         if (!execute_passes(file_path, file_size, passes_executed))
         {
@@ -276,21 +608,27 @@ namespace aegis::sanitizer
         }
         record.passes_completed = passes_executed;
 
-        // Automated verification:
-        // If the final pass was zero-fill, verify all bytes are 0x00
-        if (config_.method == SanitizationMethod::NIST_800_88_CLEAR ||
-            config_.method == SanitizationMethod::ZERO_ONLY ||
-            (config_.method == SanitizationMethod::PRNG_CUSTOM && config_.zero_fill))
+        // 2. FILE SLACK SPACE ELIMINATION (FIEMAP + FTRUNCATE EXTENSION)
+        record.slack_space_eliminated = eliminate_slack_space(file_path, file_size, record.slack_space_status);
+
+        // 3. VERIFICATION PASS (MUST PRECEDE TRIM TO PREVENT FALSE DISCARD READS)
+        bool is_final_pass_zero = (config_.method == SanitizationMethod::NIST_800_88_CLEAR ||
+                                   config_.method == SanitizationMethod::ZERO_ONLY ||
+                                   (config_.method == SanitizationMethod::PRNG_CUSTOM && config_.zero_fill));
+
+        if (is_final_pass_zero)
         {
+            record.verification_type = "BYTE_ZERO_CHECK";
             record.verification_passed = verify_target_pattern(file_path, file_size, 0x00);
+            record.calculated_entropy = 0.0;
         }
         else
         {
-            // For DoD or pure PRNG passes ending in pseudo-random, file exists and was written
-            record.verification_passed = true;
+            record.verification_type = "SHANNON_ENTROPY_CHECK";
+            record.verification_passed = verify_entropy(file_path, file_size, record.calculated_entropy);
         }
 
-        // Hardware sync & Linux TRIM hole punching
+        // 4. HARDWARE CACHE SYNC & DISCARD / TRIM
 #if defined(__linux__) || defined(__unix__)
         int fd = open(file_path.c_str(), O_WRONLY);
         if (fd >= 0)
@@ -302,12 +640,31 @@ namespace aegis::sanitizer
         }
 #endif
 
-        scrub_metadata(file_path);
+        // 5. EQUAL-LENGTH METADATA SCRUB & REMOVAL
+        // 5. EQUAL-LENGTH METADATA SCRUB & REMOVAL
+        record.metadata_scrub_completed = scrub_metadata(file_path);
 
-        record.status = record.verification_passed ? "SUCCESS_VERIFIED" : "SUCCESS_UNVERIFIED";
+        bool slack_ok = record.slack_space_eliminated ||
+                        record.slack_space_status.rfind("SKIPPED", 0) == 0;
+
+        if (!record.verification_passed)
+        {
+            record.status = "FAILED_VERIFICATION";
+        }
+        else if (!record.metadata_scrub_completed || !slack_ok)
+        {
+            record.status = "SUCCESS_WITH_WARNINGS";
+        }
+        else
+        {
+            record.status = "SUCCESS_VERIFIED";
+        }
+
         record.end_time = get_iso_timestamp();
         records_.push_back(record);
-        return true;
+
+        // Returns true if payload overwrite and unlinking succeeded
+        return record.verification_passed && (record.status != "FAILED_OVERWRITE");
     }
 
     bool FileShredder::shred_directory(const std::filesystem::path &dir_path)
@@ -388,8 +745,13 @@ namespace aegis::sanitizer
             out << "      \"sanitization_standard\": \"" << r.sanitization_standard << "\",\n";
             out << "      \"file_size_bytes\": " << r.file_size_bytes << ",\n";
             out << "      \"passes_completed\": " << r.passes_completed << ",\n";
+            out << "      \"slack_space_eliminated\": " << (r.slack_space_eliminated ? "true" : "false") << ",\n";
+            out << "      \"slack_space_status\": \"" << r.slack_space_status << "\",\n";
             out << "      \"trim_invoked\": " << (r.trim_invoked ? "true" : "false") << ",\n";
+            out << "      \"verification_type\": \"" << r.verification_type << "\",\n";
+            out << "      \"calculated_entropy\": " << std::fixed << std::setprecision(4) << r.calculated_entropy << ",\n";
             out << "      \"verification_passed\": " << (r.verification_passed ? "true" : "false") << ",\n";
+            out << "      \"metadata_scrub_completed\": " << (r.metadata_scrub_completed ? "true" : "false") << ",\n";
             out << "      \"status\": \"" << r.status << "\",\n";
             out << "      \"start_time\": \"" << r.start_time << "\",\n";
             out << "      \"end_time\": \"" << r.end_time << "\"\n";
