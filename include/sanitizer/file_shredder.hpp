@@ -12,16 +12,15 @@ enum class SanitizationMethod {
     NIST_800_88_CLEAR, // 1-pass: 0x00
     DOD_5220_22_M,     // 3-pass: Fixed 0x00 -> Fixed 0xFF -> PRNG Random
     PRNG_CUSTOM,       // N-pass PRNG + optional 0x00
-    ZERO_ONLY,   // Simple zero fill
-    GUTMANN       
+    ZERO_ONLY,         // Simple zero fill
+    GUTMANN            // 35-pass Gutmann
 };
-
 
 struct ShredConfig {
     SanitizationMethod method = SanitizationMethod::NIST_800_88_CLEAR;
-    uint32_t passes = 1;               // Used when method == PRNG_CUSTOM
-    bool zero_fill = true;              // Final zero pass for PRNG_CUSTOM
-    size_t buffer_size = 64 * 1024;     // 64 KB chunk size
+    uint32_t passes = 1;
+    bool zero_fill = true;
+    size_t buffer_size = 64 * 1024;
     bool recursive = false;
     std::string report_path = "";
 };
@@ -33,6 +32,9 @@ struct AuditRecord {
     uint32_t passes_completed = 0;
     bool trim_invoked = false;
     bool verification_passed = false;
+    double calculated_entropy = 0.0;
+    std::string verification_type = "NONE";
+    bool metadata_scrub_completed = false;   // NEW: tracks rename/unlink success
     std::string status = "PENDING";
     std::string start_time;
     std::string end_time;
@@ -55,8 +57,9 @@ private:
 
     bool execute_passes(const std::filesystem::path& path, uint64_t size, uint32_t& passes_executed);
     bool verify_target_pattern(const std::filesystem::path& path, uint64_t size, uint8_t expected_byte);
+    bool verify_entropy(const std::filesystem::path& path, uint64_t size, double& out_entropy);
     void deallocate_blocks(int fd, uint64_t size);
-    void scrub_metadata(const std::filesystem::path& path);
+    bool scrub_metadata(const std::filesystem::path& path);   // CHANGED: void -> bool
     std::string get_standard_name() const;
 };
 
