@@ -1,41 +1,65 @@
-#pragma once
+#ifndef AEGIS_FILE_SHREDDER_HPP
+#define AEGIS_FILE_SHREDDER_HPP
 
 #include <string>
-#include <cstdint>
 #include <vector>
+#include <cstdint>
+#include <filesystem>
 
 namespace aegis::sanitizer {
 
-enum class WipeStandard {
-    NIST_CLEAR,     // 1 Zero-fill pass
-    DOD_3PASS,      // Pass 1: Random, Pass 2: Complement/Pattern, Pass 3: Random + Zero
-    GUTMANN_BASIC   // Custom N-pass sequence
+enum class SanitizationMethod {
+    NIST_800_88_CLEAR, // 1-pass: 0x00
+    DOD_5220_22_M,     // 3-pass: Fixed 0x00 -> Fixed 0xFF -> PRNG Random
+    PRNG_CUSTOM,       // N-pass PRNG + optional 0x00
+    ZERO_ONLY,   // Simple zero fill
+    GUTMANN       
 };
 
+
 struct ShredConfig {
-    uint32_t iterations = 3;   // Default 3 passes (like shred.c)[cite: 2]
-    bool zero_fill = true;     // Final 0x00 pass to hide shredding[cite: 2]
-    bool remove = true;        // Obfuscate directory slot and unlink[cite: 2]
-    bool clear_slack = true;   // Round up to filesystem block size[cite: 2]
+    SanitizationMethod method = SanitizationMethod::NIST_800_88_CLEAR;
+    uint32_t passes = 1;               // Used when method == PRNG_CUSTOM
+    bool zero_fill = true;              // Final zero pass for PRNG_CUSTOM
+    size_t buffer_size = 64 * 1024;     // 64 KB chunk size
+    bool recursive = false;
+    std::string report_path = "";
+};
+
+struct AuditRecord {
+    std::string target_path;
+    std::string sanitization_standard;
+    uint64_t file_size_bytes = 0;
+    uint32_t passes_completed = 0;
+    bool trim_invoked = false;
+    bool verification_passed = false;
+    std::string status = "PENDING";
+    std::string start_time;
+    std::string end_time;
 };
 
 class FileShredder {
 public:
-    FileShredder() = default;
-    ~FileShredder() = default;
+    explicit FileShredder(ShredConfig config = ShredConfig());
 
-    // Primary entry point for surgical file destruction
-    bool shred_file(const std::string& filepath, const ShredConfig& config = ShredConfig{});
+    bool shred(const std::filesystem::path& target_path);
+    bool shred_file(const std::filesystem::path& file_path);
+    bool shred_directory(const std::filesystem::path& dir_path);
+    bool export_audit_json(const std::filesystem::path& output_json_path);
+
+    const std::vector<AuditRecord>& get_records() const { return records_; }
 
 private:
-    // Core engine loops adapted from shred.c[cite: 2]
-    bool do_wipefd(int fd, uint64_t target_size, const ShredConfig& config);
-    bool dopass(int fd, uint64_t size, int pass_num, int total_passes, bool is_zero_pass);
-    bool dosync(int fd);
-    
-    // Directory slot obfuscation and metadata scrubbing[cite: 2]
-    bool wipename(const std::string& filepath);
-    bool sync_directory(const std::string& dirpath);
+    ShredConfig config_;
+    std::vector<AuditRecord> records_;
+
+    bool execute_passes(const std::filesystem::path& path, uint64_t size, uint32_t& passes_executed);
+    bool verify_target_pattern(const std::filesystem::path& path, uint64_t size, uint8_t expected_byte);
+    void deallocate_blocks(int fd, uint64_t size);
+    void scrub_metadata(const std::filesystem::path& path);
+    std::string get_standard_name() const;
 };
 
 } // namespace aegis::sanitizer
+
+#endif // AEGIS_FILE_SHREDDER_HPP
