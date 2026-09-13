@@ -19,3 +19,4 @@ shred.c
 *.txt
 *.tmp
 *.bin
+*.json
