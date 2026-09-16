@@ -36,6 +36,7 @@ Aegis operates directly on raw filesystem blocks, making it completely format-ag
 ./aegis_cli shred /path/to/financial_report.pdf
 ./aegis_cli shred /path/to/database.sqlite
 ./aegis_cli shred /path/to/system_dump.img
+./aegis_cli shread /path/to that file --recursive method= --audit.json 
 
 # Custom profile: 7 chaotic PRNG passes without final zero-fill
 ./aegis_cli shred confidential.docx --passes 7 --no-zero
