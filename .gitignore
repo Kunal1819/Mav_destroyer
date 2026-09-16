@@ -21,7 +21,7 @@ shred.c
 *.bin
 *.json
 
-recup_dir.[1|2]
+recup_dir.[1-9]
 
 photorec.se2
 
