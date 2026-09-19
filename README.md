@@ -19,7 +19,7 @@ sudo dnf install -y gcc-c++ nwipe
 Build the unified CLI binary:
 
 ```bash
-g++ -std=c++20 -Iinclude src/sanitizer/file_shredder.cpp src/main_cli.cpp -o aegis_cli
+g++ -std=c++20 -Iinclude src/sanitizer/file_shredder.cpp src/sanitizer/platform_fs_posix.cpp src/main_cli.cpp -o aegis_cli
 ```
 
 ---
