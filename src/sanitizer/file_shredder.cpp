@@ -1,4 +1,6 @@
 #include "sanitizer/file_shredder.hpp"
+#include "sanitizer/platform_fs.hpp"
+
 #include <iostream>
 #include <fstream>
 #include <random>
@@ -6,99 +8,12 @@
 #include <iomanip>
 #include <sstream>
 #include <cstring>
-#include <cerrno>
 #include <algorithm>
 #include <cmath>
 #include <array>
 
-#if defined(__linux__) || defined(__unix__)
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-#include <sys/vfs.h>
-#include <linux/falloc.h>
-#include <linux/fs.h>
-#include <linux/fiemap.h>
-#endif
-
-// ---------------------------------------------------------------------------
-// Filesystem magic numbers.
-// linux/magic.h does not carry all of these on every distro / kernel header
-// version, so they are defined defensively here.
-// ---------------------------------------------------------------------------
-#if defined(__linux__)
-#ifndef MSDOS_SUPER_MAGIC
-#define MSDOS_SUPER_MAGIC 0x00004d44 // FAT12 / FAT16 / FAT32 (vfat driver)
-#endif
-#ifndef EXFAT_SUPER_MAGIC
-#define EXFAT_SUPER_MAGIC 0x2011BAB0 // exfat driver (kernel >= 5.7)
-#endif
-#ifndef NTFS_SB_MAGIC
-#define NTFS_SB_MAGIC 0x5346544e // "NTFS" - in-kernel ntfs / ntfs3
-#endif
-#ifndef EXT4_SUPER_MAGIC
-#define EXT4_SUPER_MAGIC 0x0000EF53
-#endif
-#ifndef XFS_SUPER_MAGIC
-#define XFS_SUPER_MAGIC 0x58465342
-#endif
-#ifndef BTRFS_SUPER_MAGIC
-#define BTRFS_SUPER_MAGIC 0x9123683E
-#endif
-#ifndef TMPFS_MAGIC
-#define TMPFS_MAGIC 0x01021994
-#endif
-#ifndef FUSE_SUPER_MAGIC
-#define FUSE_SUPER_MAGIC 0x65735546
-#endif
-#endif
-
 namespace aegis::sanitizer
 {
-
-#if defined(__linux__)
-    namespace
-    {
-        // Filesystems that allocate storage in whole clusters and expose no FIEMAP.
-        // For these the tail allocation unit is read from statfs() instead.
-        bool is_cluster_allocated_fs(unsigned long fs_type)
-        {
-            return fs_type == static_cast<unsigned long>(MSDOS_SUPER_MAGIC) ||
-                   fs_type == static_cast<unsigned long>(EXFAT_SUPER_MAGIC) ||
-                   fs_type == static_cast<unsigned long>(NTFS_SB_MAGIC);
-        }
-
-        std::string fs_type_name(unsigned long fs_type)
-        {
-            switch (fs_type)
-            {
-            case static_cast<unsigned long>(MSDOS_SUPER_MAGIC):
-                return "FAT (vfat)";
-            case static_cast<unsigned long>(EXFAT_SUPER_MAGIC):
-                return "exFAT";
-            case static_cast<unsigned long>(NTFS_SB_MAGIC):
-                return "NTFS";
-            case static_cast<unsigned long>(EXT4_SUPER_MAGIC):
-                return "ext2/ext3/ext4";
-            case static_cast<unsigned long>(XFS_SUPER_MAGIC):
-                return "XFS";
-            case static_cast<unsigned long>(BTRFS_SUPER_MAGIC):
-                return "btrfs";
-            case static_cast<unsigned long>(TMPFS_MAGIC):
-                return "tmpfs";
-            case static_cast<unsigned long>(FUSE_SUPER_MAGIC):
-                return "FUSE";
-            default:
-            {
-                std::stringstream ss;
-                ss << "UNKNOWN(0x" << std::hex << fs_type << ")";
-                return ss.str();
-            }
-            }
-        }
-    } // namespace
-#endif
 
     static std::string get_iso_timestamp()
     {
@@ -110,20 +25,6 @@ namespace aegis::sanitizer
     }
 
     FileShredder::FileShredder(ShredConfig config) : config_(std::move(config)) {}
-
-    std::string FileShredder::slack_mode_to_string(SlackMode mode)
-    {
-        switch (mode)
-        {
-        case SlackMode::EXTENT:
-            return "EXTENT";
-        case SlackMode::CLUSTER:
-            return "CLUSTER";
-        case SlackMode::UNKNOWN:
-        default:
-            return "UNKNOWN";
-        }
-    }
 
     std::string FileShredder::get_standard_name() const
     {
@@ -143,6 +44,8 @@ namespace aegis::sanitizer
         return "Unknown Standard";
     }
 
+    // The pattern the slack-space overwrite should use, so the tail of the last
+    // block/cluster matches whatever the final content pass wrote.
     std::vector<uint8_t> FileShredder::get_final_pass_pattern() const
     {
         auto random_block = []() -> std::vector<uint8_t>
@@ -180,311 +83,6 @@ namespace aegis::sanitizer
             return random_block();
         }
         return {0x00};
-    }
-
-    // ---------------------------------------------------------------------------
-    // Discard / TRIM.
-    // Returns true ONLY if the hole punch actually succeeded. FAT32/exFAT do not
-    // implement FALLOC_FL_PUNCH_HOLE, so this legitimately fails on USB media and
-    // the audit record must say so rather than claiming a TRIM that never happened.
-    // ---------------------------------------------------------------------------
-    bool FileShredder::deallocate_blocks(int fd, uint64_t size, std::string &out_status)
-    {
-#if defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE)
-        if (fd < 0)
-        {
-            out_status = "FAILED_BAD_FD";
-            return false;
-        }
-        if (size == 0)
-        {
-            out_status = "SKIPPED_EMPTY_FILE";
-            return false;
-        }
-
-        if (fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(size)) != 0)
-        {
-            const int err = errno;
-            if (err == EOPNOTSUPP || err == ENOTSUP || err == ENOSYS || err == ENOTTY)
-            {
-                out_status = "FAILED_UNSUPPORTED_FS";
-                std::cerr << "[!] Discard: filesystem does not support PUNCH_HOLE (no TRIM performed).\n";
-            }
-            else
-            {
-                out_status = "FAILED_ERRNO_" + std::to_string(err);
-                std::cerr << "[-] Discard: fallocate PUNCH_HOLE failed (errno: " << err << ")\n";
-            }
-            return false;
-        }
-
-        fsync(fd);
-        out_status = "SUCCESS";
-        return true;
-#else
-        (void)fd;
-        (void)size;
-        out_status = "UNSUPPORTED_PLATFORM";
-        return false;
-#endif
-    }
-
-    // ---------------------------------------------------------------------------
-    // FILE SLACK SPACE ELIMINATION
-    //
-    // Two strategies behind one entry point:
-    //
-    //   EXTENT mode  (ext4 / XFS / btrfs): FS_IOC_FIEMAP confirms the file owns a
-    //                real physical extent and is not stored inline in the inode.
-    //                Allocation unit taken from fstat().st_blksize.
-    //
-    //   CLUSTER mode (FAT32 / exFAT / NTFS): no FIEMAP exists in these drivers.
-    //                FAT-family filesystems allocate in whole clusters, so the tail
-    //                cluster is already owned by the file and the allocation unit is
-    //                read from statfs().f_bsize. There is no inline-data concept.
-    //
-    // Both then run the same sequence: grow the logical EOF to the allocation-unit
-    // boundary (which reuses the already-allocated tail unit rather than allocating
-    // a new one), overwrite the exposed tail bytes, flush, then restore the original
-    // logical size. The physical bytes stay overwritten; only the size metadata is
-    // rolled back.
-    //
-    // Caveat (documented, not fixed): on Copy-on-Write filesystems (btrfs, ZFS) the
-    // ftruncate grow may relocate the tail rather than reuse it. CLUSTER mode cannot
-    // verify reuse at all, since there is no extent map to consult - it relies on the
-    // FAT allocation model being in-place, which it is.
-    // ---------------------------------------------------------------------------
-    bool FileShredder::eliminate_slack_space(const std::filesystem::path &path,
-                                             uint64_t logical_size,
-                                             std::string &out_status,
-                                             SlackMode &out_mode,
-                                             uint64_t &out_unit_size,
-                                             uint64_t &out_bytes_overwritten,
-                                             std::string &out_fs_name)
-    {
-        out_mode = SlackMode::UNKNOWN;
-        out_unit_size = 0;
-        out_bytes_overwritten = 0;
-        out_fs_name = "UNKNOWN";
-
-#if defined(__linux__)
-        if (logical_size == 0)
-        {
-            out_status = "SKIPPED_EMPTY_FILE";
-            return true;
-        }
-
-        int fd = open(path.c_str(), O_RDWR);
-        if (fd < 0)
-        {
-            out_status = "FAILED_OPEN_FILE";
-            std::cerr << "[-] Slack: failed to open file for R/W: " << path << "\n";
-            return false;
-        }
-
-        // ---- 1. Identify the filesystem and pick a strategy ------------------
-        struct stat st;
-        if (fstat(fd, &st) != 0)
-        {
-            close(fd);
-            out_status = "FAILED_FSTAT";
-            return false;
-        }
-
-        struct statfs sfs;
-        bool have_statfs = (fstatfs(fd, &sfs) == 0);
-        unsigned long fs_magic = have_statfs ? static_cast<unsigned long>(sfs.f_type) : 0UL;
-        out_fs_name = have_statfs ? fs_type_name(fs_magic) : "UNKNOWN";
-
-        const bool cluster_fs = have_statfs && is_cluster_allocated_fs(fs_magic);
-
-        // Allocation unit: cluster size on FAT-family, block size elsewhere.
-        uint64_t unit_size = 0;
-        if (cluster_fs && have_statfs && sfs.f_bsize > 0)
-        {
-            unit_size = static_cast<uint64_t>(sfs.f_bsize);
-        }
-        else if (st.st_blksize > 0)
-        {
-            unit_size = static_cast<uint64_t>(st.st_blksize);
-        }
-        else
-        {
-            unit_size = 4096;
-        }
-        out_unit_size = unit_size;
-
-        const uint64_t remainder = logical_size % unit_size;
-        if (remainder == 0)
-        {
-            close(fd);
-            out_mode = cluster_fs ? SlackMode::CLUSTER : SlackMode::EXTENT;
-            out_status = "SKIPPED_NO_SLACK";
-            return true;
-        }
-
-        // ---- 2. EXTENT mode pre-checks (FIEMAP) ------------------------------
-        bool used_cluster_fallback = false;
-        SlackMode mode = cluster_fs ? SlackMode::CLUSTER : SlackMode::EXTENT;
-
-        if (!cluster_fs)
-        {
-            constexpr uint32_t kMaxExtents = 32;
-            const size_t fiemap_size = sizeof(struct fiemap) + (kMaxExtents * sizeof(struct fiemap_extent));
-            std::vector<uint8_t> fiemap_buffer(fiemap_size, 0);
-
-            struct fiemap *fmap = reinterpret_cast<struct fiemap *>(fiemap_buffer.data());
-            fmap->fm_start = 0;
-            fmap->fm_length = logical_size;
-            fmap->fm_flags = FIEMAP_FLAG_SYNC;
-            fmap->fm_extent_count = kMaxExtents;
-
-            if (ioctl(fd, FS_IOC_FIEMAP, fmap) < 0)
-            {
-                const int err = errno;
-                if (err == ENOTTY || err == EOPNOTSUPP || err == ENOTSUP)
-                {
-                    // Unknown filesystem with no extent map. Fall back to the
-                    // allocation-unit approach as best effort and label it clearly
-                    // in the audit rather than silently calling it a normal success.
-                    used_cluster_fallback = true;
-                    mode = SlackMode::CLUSTER;
-                    std::cerr << "[!] Slack: no FIEMAP on " << out_fs_name
-                              << " - falling back to allocation-unit (cluster) mode.\n";
-                }
-                else
-                {
-                    close(fd);
-                    out_status = "FAILED_IOCTL_ERROR";
-                    std::cerr << "[-] Slack: FS_IOC_FIEMAP ioctl error (errno: " << err << ")\n";
-                    return false;
-                }
-            }
-            else
-            {
-                if (fmap->fm_mapped_extents == 0)
-                {
-                    close(fd);
-                    out_mode = SlackMode::EXTENT;
-                    out_status = "FAILED_NO_EXTENTS";
-                    std::cerr << "[-] Slack: no physical extents mapped (sparse/inline file).\n";
-                    return false;
-                }
-
-                const struct fiemap_extent &last_extent = fmap->fm_extents[fmap->fm_mapped_extents - 1];
-
-                // ext4 inline-data feature stores tiny files inside the inode itself;
-                // btrfs inlines files below max_inline (often ~2KB). There is no tail
-                // block to grow into in that case.
-                if (last_extent.fe_flags & FIEMAP_EXTENT_DATA_INLINE)
-                {
-                    close(fd);
-                    out_mode = SlackMode::EXTENT;
-                    out_status = "SKIPPED_INLINE_INODE_DATA";
-                    return true;
-                }
-            }
-        }
-
-        out_mode = mode;
-
-        const uint64_t target_size = logical_size + (unit_size - remainder);
-        const size_t bytes_to_overwrite = static_cast<size_t>(target_size - logical_size);
-
-        // ---- 3. Grow logical EOF to the allocation-unit boundary -------------
-        if (ftruncate(fd, static_cast<off_t>(target_size)) != 0)
-        {
-            const int err = errno;
-            close(fd);
-            out_status = "FAILED_FTRUNCATE_GROW";
-            std::cerr << "[-] Slack: ftruncate grow failed (errno: " << err << ")\n";
-            return false;
-        }
-
-        // ---- 4. Seek to the start of slack (original logical EOF) ------------
-        if (lseek(fd, static_cast<off_t>(logical_size), SEEK_SET) == static_cast<off_t>(-1))
-        {
-            const int err = errno;
-            ftruncate(fd, static_cast<off_t>(logical_size));
-            close(fd);
-            out_status = "FAILED_SEEK_EOF";
-            std::cerr << "[-] Slack: lseek to logical EOF failed (errno: " << err << ")\n";
-            return false;
-        }
-
-        // ---- 5. Overwrite slack with the same pattern as the final pass ------
-        const std::vector<uint8_t> pattern = get_final_pass_pattern();
-        std::vector<uint8_t> write_buf(bytes_to_overwrite);
-        for (size_t i = 0; i < bytes_to_overwrite; ++i)
-        {
-            write_buf[i] = pattern[i % pattern.size()];
-        }
-
-        size_t total_written = 0;
-        while (total_written < bytes_to_overwrite)
-        {
-            ssize_t written = write(fd, write_buf.data() + total_written, bytes_to_overwrite - total_written);
-            if (written <= 0)
-            {
-                if (written < 0 && errno == EINTR)
-                {
-                    continue;
-                }
-                const int err = errno;
-                ftruncate(fd, static_cast<off_t>(logical_size));
-                close(fd);
-                out_status = "FAILED_WRITE_SLACK";
-                std::cerr << "[-] Slack: write to slack bytes failed (errno: " << err << ")\n";
-                return false;
-            }
-            total_written += static_cast<size_t>(written);
-        }
-
-        // ---- 6. Flush to physical media before shrinking back ----------------
-        if (fdatasync(fd) != 0)
-        {
-            const int err = errno;
-            ftruncate(fd, static_cast<off_t>(logical_size));
-            close(fd);
-            out_status = "FAILED_FDATASYNC";
-            std::cerr << "[-] Slack: fdatasync failed (errno: " << err << ")\n";
-            return false;
-        }
-
-        // ---- 7. Restore the original logical size (metadata only) ------------
-        if (ftruncate(fd, static_cast<off_t>(logical_size)) != 0)
-        {
-            const int err = errno;
-            close(fd);
-            out_status = "FAILED_FTRUNCATE_RESTORE";
-            std::cerr << "[-] Slack: ftruncate restore failed (errno: " << err << ")\n";
-            return false;
-        }
-
-        fdatasync(fd);
-        close(fd);
-
-        out_bytes_overwritten = static_cast<uint64_t>(bytes_to_overwrite);
-
-        if (used_cluster_fallback)
-        {
-            out_status = "SUCCESS_CLUSTER_FALLBACK";
-        }
-        else if (mode == SlackMode::CLUSTER)
-        {
-            out_status = "SUCCESS_CLUSTER_MODE";
-        }
-        else
-        {
-            out_status = "SUCCESS";
-        }
-        return true;
-#else
-        (void)path;
-        (void)logical_size;
-        out_status = "UNSUPPORTED_PLATFORM";
-        return false;
-#endif
     }
 
     bool FileShredder::verify_target_pattern(const std::filesystem::path &path, uint64_t size, uint8_t expected_byte)
@@ -708,13 +306,15 @@ namespace aegis::sanitizer
     // ---------------------------------------------------------------------------
     // Directory-entry slack cleansing.
     //
-    // Renames through an equal-length mask first so the full original name_len slot
-    // in the directory record is overwritten, then shrinks the name to force record
+    // Renames through an equal-length mask first so the full original name slot in
+    // the directory record is overwritten, then shrinks the name to force record
     // consolidation, then unlinks. Rename failures are surfaced, not swallowed.
     //
-    // Note: FAT/exFAT directory entries and NTFS index records do not lay out names
-    // the way ext4's ext4_dir_entry_2 does, so the effectiveness of the equal-length
-    // mask varies by filesystem. The unlink itself always runs.
+    // Effectiveness is filesystem-dependent: this is modelled on ext4's
+    // ext4_dir_entry_2 layout. NTFS index records ($INDEX_ROOT/$INDEX_ALLOCATION
+    // B-trees), exFAT directory entry sets and FAT32 LFN chains lay names out
+    // differently, and NTFS additionally records renames in the USN journal. The
+    // final unlink always runs regardless.
     // ---------------------------------------------------------------------------
     bool FileShredder::scrub_metadata(const std::filesystem::path &path)
     {
@@ -787,6 +387,7 @@ namespace aegis::sanitizer
 
         uint64_t file_size = fs::file_size(file_path, ec);
         record.file_size_bytes = file_size;
+        record.filesystem_type = platform::detect_filesystem_name(file_path);
 
         // 1. OVERWRITE PASSES
         uint32_t passes_executed = 0;
@@ -799,18 +400,29 @@ namespace aegis::sanitizer
         }
         record.passes_completed = passes_executed;
 
-        // 2. FILE SLACK SPACE ELIMINATION (extent mode or cluster mode)
-        SlackMode slack_mode = SlackMode::UNKNOWN;
-        record.slack_space_eliminated = eliminate_slack_space(file_path,
-                                                             file_size,
-                                                             record.slack_space_status,
-                                                             slack_mode,
-                                                             record.allocation_unit_bytes,
-                                                             record.slack_bytes_overwritten,
-                                                             record.filesystem_type);
-        record.slack_space_mode = slack_mode_to_string(slack_mode);
+        // 2. FLUSH TO MEDIA
+        // Must happen before verification, otherwise the read-back can be served
+        // from the OS page cache and "verify" a write that never reached the disk.
+        platform::flush_file_to_media(file_path);
 
-        // 3. VERIFICATION PASS (MUST PRECEDE TRIM TO PREVENT FALSE DISCARD READS)
+        // 3. FILE SLACK SPACE ELIMINATION (extent mode on ext4/XFS, cluster mode
+        //    on FAT/exFAT/NTFS). Runs before TRIM so discard cannot disturb it.
+        {
+            const platform::SlackResult slack =
+                platform::eliminate_slack_space(file_path, file_size, get_final_pass_pattern());
+
+            record.slack_space_eliminated = slack.eliminated;
+            record.slack_space_status = slack.status;
+            record.slack_space_mode = slack.mode;
+            record.allocation_unit_bytes = slack.unit_size;
+            record.slack_bytes_overwritten = slack.bytes_overwritten;
+            if (record.filesystem_type == "UNKNOWN" && slack.fs_name != "UNKNOWN")
+            {
+                record.filesystem_type = slack.fs_name;
+            }
+        }
+
+        // 4. VERIFICATION PASS (MUST PRECEDE TRIM TO PREVENT FALSE DISCARD READS)
         bool is_final_pass_zero = (config_.method == SanitizationMethod::NIST_800_88_CLEAR ||
                                    config_.method == SanitizationMethod::ZERO_ONLY ||
                                    (config_.method == SanitizationMethod::PRNG_CUSTOM && config_.zero_fill));
@@ -827,22 +439,15 @@ namespace aegis::sanitizer
             record.verification_passed = verify_entropy(file_path, file_size, record.calculated_entropy);
         }
 
-        // 4. HARDWARE CACHE SYNC & DISCARD / TRIM
-#if defined(__linux__) || defined(__unix__)
-        int fd = open(file_path.c_str(), O_WRONLY);
-        if (fd >= 0)
+        // 5. DISCARD / TRIM
         {
-            fdatasync(fd);
-            record.trim_invoked = deallocate_blocks(fd, file_size, record.trim_status);
-            close(fd);
+            const platform::DiscardResult discard =
+                platform::discard_file_blocks(file_path, file_size);
+            record.trim_invoked = discard.invoked;
+            record.trim_status = discard.status;
         }
-        else
-        {
-            record.trim_status = "FAILED_OPEN_FILE";
-        }
-#endif
 
-        // 5. EQUAL-LENGTH METADATA SCRUB & REMOVAL
+        // 6. EQUAL-LENGTH METADATA SCRUB & REMOVAL
         record.metadata_scrub_completed = scrub_metadata(file_path);
 
         const bool slack_ok = record.slack_space_eliminated ||
