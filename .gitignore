@@ -24,4 +24,5 @@ shred.c
 recup_dir.[1-9]
 
 photorec.se2
+*.exe 
 
