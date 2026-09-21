@@ -16,12 +16,16 @@ sudo dnf install -y gcc-c++ nwipe
 
 ## Compilation
 
-Build the unified CLI binary:
+Compilation for LINUX:
 
 ```bash
 g++ -std=c++20 -Iinclude src/sanitizer/file_shredder.cpp src/sanitizer/platform_fs_posix.cpp src/main_cli.cpp -o aegis_cli
 ```
 
+Compilation for WINDOWS 
+
+```bash
+g++ -std=c++20 -Iinclude src\sanitizer\file_shredder.cpp src\sanitizer\platform_fs_win32.cpp src\main_cli.cpp -o aegis_cli.exe
 ---
 
 ## Quickstart & Verification Guide
