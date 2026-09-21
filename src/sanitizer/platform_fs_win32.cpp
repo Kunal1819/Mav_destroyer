@@ -393,7 +393,6 @@ SlackResult eliminate_slack_space(const std::filesystem::path& path,
 // live data, so an SSD can release the underlying NAND. It is NTFS-only and
 // needs Windows 8 / Server 2012 or newer - on exFAT / FAT32 it fails, and the
 // audit record says so rather than claiming a TRIM that never happened.
-// ---------------------------------------------------------------------------
 DiscardResult discard_file_blocks(const std::filesystem::path& path, uint64_t logical_size) {
     DiscardResult d;
 
@@ -402,7 +401,15 @@ DiscardResult discard_file_blocks(const std::filesystem::path& path, uint64_t lo
         return d;
     }
 
-    Handle h(open_rw(path));
+    HANDLE raw_h = CreateFileW(path.c_str(),
+                               GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr,
+                               OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+
+    Handle h(raw_h);
     if (!h.valid()) {
         d.status = win_err_status("FAILED_OPEN_", GetLastError());
         return d;
@@ -410,41 +417,42 @@ DiscardResult discard_file_blocks(const std::filesystem::path& path, uint64_t lo
 
     FlushFileBuffers(h.get());
 
-    AEGIS_FILE_LEVEL_TRIM trim;
-    ZeroMemory(&trim, sizeof(trim));
-    trim.Key = 0;
-    trim.NumRanges = 1;
-    trim.Ranges[0].Offset = 0;
-    trim.Ranges[0].Length = logical_size;
-
-    AEGIS_FILE_LEVEL_TRIM_OUTPUT trim_out;
-    ZeroMemory(&trim_out, sizeof(trim_out));
-
+    // Step 1: Mark the file as sparse. This allows NTFS to deallocate clusters
+    // instead of actually writing zeroes to them.
     DWORD bytes_returned = 0;
-    if (!DeviceIoControl(h.get(), FSCTL_FILE_LEVEL_TRIM,
-                         &trim, sizeof(trim),
-                         &trim_out, sizeof(trim_out),
+    if (!DeviceIoControl(h.get(), FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &bytes_returned, nullptr)) {
+        d.status = win_err_status("FAILED_SET_SPARSE_", GetLastError());
+        return d;
+    }
+
+    // Step 2: Punch the hole.
+    // On a sparse file, SET_ZERO_DATA deallocates the clusters from the MFT.
+    // Windows will then natively issue a TRIM/UNMAP to the SSD.
+    FILE_ZERO_DATA_INFORMATION zero_info;
+    zero_info.FileOffset.QuadPart = 0;
+    
+    // We want to punch out the entire file plus any slack space up to the cluster boundary.
+    const uint64_t cluster_size = cluster_size_of(path);
+    const uint64_t unit = (cluster_size > 0) ? cluster_size : 4096;
+    const uint64_t aligned_len = ((logical_size + unit - 1) / unit) * unit;
+    
+    zero_info.BeyondFinalZero.QuadPart = static_cast<LONGLONG>(aligned_len);
+
+    if (!DeviceIoControl(h.get(), FSCTL_SET_ZERO_DATA,
+                         &zero_info, sizeof(zero_info),
+                         nullptr, 0,
                          &bytes_returned, nullptr)) {
         const DWORD err = GetLastError();
         if (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED) {
             d.status = "FAILED_UNSUPPORTED_FS";
-            std::cerr << "[!] Discard: volume does not support FILE_LEVEL_TRIM (no TRIM performed).\n";
         } else {
             d.status = win_err_status("FAILED_ERR_", err);
-            std::cerr << "[-] Discard: FSCTL_FILE_LEVEL_TRIM failed (GetLastError: " << err << ")\n";
         }
         return d;
     }
 
-    if (trim_out.NumRangesProcessed == 0) {
-        // The FSCTL succeeded but the storage stack discarded nothing - do not
-        // report this as a TRIM.
-        d.status = "FAILED_NO_RANGES_PROCESSED";
-        return d;
-    }
-
     d.invoked = true;
-    d.status = "SUCCESS";
+    d.status = "SUCCESS_HOLE_PUNCH";
     return d;
 }
 
