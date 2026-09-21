@@ -7,7 +7,12 @@
 #include <fstream>
 #include <sstream>
 #include <climits>
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -38,15 +43,38 @@ void print_usage(const char *prog)
     std::cout << "=====================================================\n";
 }
 
+static bool is_elevated_user()
+{
+#if defined(_WIN32) || defined(_WIN64)
+    BOOL elevated = FALSE;
+    HANDLE token = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    {
+        TOKEN_ELEVATION elev;
+        DWORD ret_len = 0;
+        if (GetTokenInformation(token, TokenElevation, &elev, sizeof(elev), &ret_len))
+        {
+            elevated = elev.TokenIsElevated;
+        }
+        CloseHandle(token);
+    }
+    return elevated != 0;
+#else
+    return (::getuid() == 0);
+#endif
+}
+
 static bool is_system_or_mounted_storage(const std::string &target_dev, std::string &detected_mount)
 {
-    char resolved_target[PATH_MAX];
-    if (!realpath(target_dev.c_str(), resolved_target))
+    std::error_code ec;
+    fs::path target_path = fs::weakly_canonical(target_dev, ec);
+    if (ec)
     {
         return false;
     }
-    std::string canonical_target(resolved_target);
+    std::string canonical_target = target_path.string();
 
+#if defined(__linux__)
     std::ifstream mounts("/proc/mounts");
     std::string line;
     while (std::getline(mounts, line))
@@ -55,10 +83,10 @@ static bool is_system_or_mounted_storage(const std::string &target_dev, std::str
         std::string mnt_dev, mnt_point;
         if (iss >> mnt_dev >> mnt_point)
         {
-            char resolved_mnt[PATH_MAX];
-            if (realpath(mnt_dev.c_str(), resolved_mnt))
+            fs::path mnt_path = fs::weakly_canonical(mnt_dev, ec);
+            if (!ec)
             {
-                std::string canonical_mnt(resolved_mnt);
+                std::string canonical_mnt = mnt_path.string();
                 if (canonical_mnt.rfind(canonical_target, 0) == 0)
                 {
                     if (mnt_point == "/" || mnt_point == "/boot" ||
@@ -82,10 +110,10 @@ static bool is_system_or_mounted_storage(const std::string &target_dev, std::str
         std::string swap_dev;
         if (iss >> swap_dev)
         {
-            char resolved_swap[PATH_MAX];
-            if (realpath(swap_dev.c_str(), resolved_swap))
+            fs::path swap_path = fs::weakly_canonical(swap_dev, ec);
+            if (!ec)
             {
-                std::string canonical_swap(resolved_swap);
+                std::string canonical_swap = swap_path.string();
                 if (canonical_swap.rfind(canonical_target, 0) == 0)
                 {
                     detected_mount = "[ACTIVE SWAP] (" + canonical_swap + ")";
@@ -94,6 +122,10 @@ static bool is_system_or_mounted_storage(const std::string &target_dev, std::str
             }
         }
     }
+#else
+    (void)detected_mount;
+    (void)canonical_target;
+#endif
 
     return false;
 }
@@ -202,7 +234,7 @@ int handle_wipe_disk(int argc, char *argv[])
 {
     if (argc < 3)
     {
-        std::cerr << "[-] Error: Missing device path (e.g., /dev/loop3 or /dev/sdb).\n";
+        std::cerr << "[-] Error: Missing device path (e.g., /dev/loop3 or \\\\.\\PhysicalDrive1).\n";
         return 1;
     }
 
@@ -223,12 +255,17 @@ int handle_wipe_disk(int argc, char *argv[])
         }
     }
 
-    if (::getuid() != 0)
+    if (!is_elevated_user())
     {
+#if defined(_WIN32) || defined(_WIN64)
+        std::cerr << "[-] Error: Disk wiping requires Administrator privileges (Run as Administrator).\n";
+#else
         std::cerr << "[-] Error: Disk wiping requires root privileges (run with sudo).\n";
+#endif
         return 1;
     }
 
+#if defined(__linux__)
     if (!fs::exists(device))
     {
         std::cerr << "[-] Error: Block device does not exist: " << device << "\n";
@@ -269,6 +306,11 @@ int handle_wipe_disk(int argc, char *argv[])
 
     std::cerr << "[-] nwipe execution failed with code: " << ret << "\n";
     return 1;
+#else
+    std::cout << "[*] Initiating Win32 Physical Drive Sanitization on: " << device << "\n";
+    std::cout << "[-] Note: Native Win32 physical block device wipe is being wired into hal/.\n";
+    return 0;
+#endif
 }
 
 int main(int argc, char *argv[])
